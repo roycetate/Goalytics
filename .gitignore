@@ -1,0 +1,36 @@
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+venv/
+.venv/
+backend/venv/
+agent/venv/
+
+# Large model weights
+*.pt
+*.onnx
+*.engine
+
+# Video and media artifacts
+*.mov
+*.mp4
+*.avi
+*.mkv
+*.webm
+
+# Generated outputs
+output_*.mp4
+*.log
+data/live_stats.json
