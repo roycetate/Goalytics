@@ -95,7 +95,7 @@ def parse_args():
     p.add_argument(
         "--conf-ball",
         type=float,
-        default=0.05,
+        default=0.03,
         help="Min confidence to keep sports ball (usually needs to be lower than person).",
     )
     p.add_argument(
@@ -132,6 +132,18 @@ def parse_args():
             "When set, persons and the ball are kept only if inside the pitch. Required for "
             "strict off-pitch suppression. Example: 0.02,0.14,0.98,0.14,0.98,0.99,0.02,0.99"
         ),
+    )
+    p.add_argument(
+        "--homography-src",
+        type=str,
+        default="",
+        help="8 numbers (x1,y1,x2,y2,x3,y3,x4,y4) in normalized 0-1 image coords for video source points.",
+    )
+    p.add_argument(
+        "--homography-dst",
+        type=str,
+        default="",
+        help="8 numbers (x1,y1,x2,y2,x3,y3,x4,y4) in normalized 0-1 image coords for 2D pitch destination points.",
     )
     p.add_argument(
         "--pitch-lift-top",
@@ -176,6 +188,12 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Split non-referee players into two teams by jersey LAB color (default: on).",
+    )
+    p.add_argument(
+        "--team-color-threshold",
+        type=float,
+        default=30.0,
+        help="Max LAB distance to assigned team centroid. Rejects outlier staff/cameramen.",
     )
     p.add_argument(
         "--referee-hsv-low",
@@ -226,10 +244,21 @@ def parse_args():
         help="Ultralytics tracker config (e.g., bytetrack.yaml or botsort.yaml).",
     )
     p.add_argument(
+        "--enable-ocr",
+        action="store_true",
+        help="Enable EasyOCR for jersey number recognition.",
+    )
+    p.add_argument(
         "--stats-out",
         type=Path,
         default=here.parent / "data" / "live_stats.json",
         help="JSON file for live stats consumed by backend /stats.",
+    )
+    p.add_argument(
+        "--live-frame-out",
+        type=Path,
+        default=here.parent / "data" / "live_frame.jpg",
+        help="JPEG file for the latest annotated frame consumed by backend /analysis-frame.",
     )
     p.add_argument(
         "--stats-every",
@@ -240,7 +269,7 @@ def parse_args():
     p.add_argument(
         "--possession-radius",
         type=float,
-        default=120.0,
+        default=160.0,
         help="Max pixel distance from ball center to player foot-center to assign possession.",
     )
     p.add_argument(
@@ -248,6 +277,12 @@ def parse_args():
         type=int,
         default=3,
         help="Require this many consecutive frames before switching ball owner/team.",
+    )
+    p.add_argument(
+        "--possession-lost-frames",
+        type=int,
+        default=18,
+        help="Keep the last ball owner for this many no-owner frames before clearing possession.",
     )
     p.add_argument(
         "--require-grass-foot",
@@ -288,20 +323,26 @@ def parse_args():
     p.add_argument(
         "--ball-recover-conf",
         type=float,
-        default=0.03,
+        default=0.02,
         help="Confidence threshold for ball recovery pass.",
     )
     p.add_argument(
         "--ball-recover-scale",
         type=float,
-        default=3.0,
+        default=5.0,
         help="Expand previous ball box by this scale to create recovery ROI.",
     )
     p.add_argument(
         "--ball-recover-max-miss",
         type=int,
-        default=15,
+        default=45,
         help="How many consecutive missed frames to keep trying ROI ball recovery.",
+    )
+    p.add_argument(
+        "--ball-kalman-gate",
+        type=float,
+        default=180.0,
+        help="Prefer ball detections within this many pixels of the Kalman prediction.",
     )
     return p.parse_args()
 
@@ -377,6 +418,54 @@ def expand_bbox(x1: int, y1: int, x2: int, y2: int, scale: float, w: int, h: int
     rx2 = min(w, int(round(cx + bw * 0.5)))
     ry2 = min(h, int(round(cy + bh * 0.5)))
     return rx1, ry1, rx2, ry2
+
+
+def bbox_around_point(cx: float, cy: float, radius: float, w: int, h: int) -> tuple[int, int, int, int]:
+    r = max(24.0, float(radius))
+    x1 = max(0, int(round(cx - r)))
+    y1 = max(0, int(round(cy - r)))
+    x2 = min(w, int(round(cx + r)))
+    y2 = min(h, int(round(cy + r)))
+    return x1, y1, x2, y2
+
+
+def choose_ball_candidate(
+    balls: list[tuple[int, int, int, int, float, int | None]],
+    prediction: tuple[float, float] | None,
+    gate_px: float,
+) -> tuple[int, int, int, int, float, int | None] | None:
+    if prediction is None:
+        return max(balls, key=lambda b: b[4])
+
+    px, py = prediction
+    gate = max(1.0, float(gate_px))
+
+    valid_balls = []
+    for ball in balls:
+        x1, y1, x2, y2, conf, _track_id = ball
+        bx = 0.5 * (x1 + x2)
+        by = 0.5 * (y1 + y2)
+        dist = float(np.hypot(bx - px, by - py))
+        
+        # Strict Kalman Gating: Reject if too far, unless confidence is high
+        if dist > gate and conf < 0.35:
+            continue
+        valid_balls.append(ball)
+
+    if not valid_balls:
+        return None
+
+    def score(ball: tuple[int, int, int, int, float, int | None]) -> float:
+        x1, y1, x2, y2, conf, _track_id = ball
+        bx = 0.5 * (x1 + x2)
+        by = 0.5 * (y1 + y2)
+        dist = float(np.hypot(bx - px, by - py))
+        proximity = max(0.0, 1.0 - (dist / gate))
+        area = max(1.0, float((x2 - x1) * (y2 - y1)))
+        size_penalty = min(0.25, area / 20000.0)
+        return float(conf) + (0.35 * proximity) - size_penalty
+
+    return max(valid_balls, key=score)
 
 
 def parse_norm_pitch_polygon(s: str) -> np.ndarray | None:
@@ -642,20 +731,47 @@ def write_json_atomic(path: Path, payload: dict) -> None:
         json.dump(payload, f)
     tmp.replace(path)
 
-def generate_pitch_heatmap(positions, pitch, output_path, frame_w, frame_h):
+
+def write_frame_atomic(path: Path, frame: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.stem}.tmp{path.suffix}")
+    ok = cv2.imwrite(str(tmp), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+    if ok:
+        tmp.replace(path)
+
+
+def generate_pitch_heatmap(positions, pitch, output_path, frame_w, frame_h, h_src=None, h_dst=None):
     import numpy as np
     import cv2
 
     h, w = pitch.shape[:2]
     heatmap = np.zeros((h, w), dtype=np.float32)
 
-    # Scale positions to pitch size
-    for x, y in positions:
-        px = int(x * w / frame_w)
-        py = int(y * h / frame_h)
+    H = None
+    if h_src is not None and h_dst is not None:
+        src_px = h_src.copy()
+        src_px[:, 0] *= frame_w
+        src_px[:, 1] *= frame_h
+        dst_px = h_dst.copy()
+        dst_px[:, 0] *= w
+        dst_px[:, 1] *= h
+        H, _ = cv2.findHomography(src_px, dst_px)
 
-        if 0 <= px < w and 0 <= py < h:
-            heatmap[py, px] += 1
+    if H is not None and len(positions) > 0:
+        pts = np.array(positions, dtype=np.float32).reshape(-1, 1, 2)
+        dst_pts = cv2.perspectiveTransform(pts, H).reshape(-1, 2)
+        for x, y in dst_pts:
+            px, py = int(x), int(y)
+            if 0 <= px < w and 0 <= py < h:
+                heatmap[py, px] += 1
+    else:
+        # Scale positions to pitch size (fallback)
+        for x, y in positions:
+            px = int(x * w / frame_w)
+            py = int(y * h / frame_h)
+
+            if 0 <= px < w and 0 <= py < h:
+                heatmap[py, px] += 1
 
     # Smooth
     heatmap = cv2.GaussianBlur(heatmap, (51, 51), 0)
@@ -719,11 +835,21 @@ def generate_heatmap(frame, positions):
 
 def main():
     args = parse_args()
+    agent_dir = Path(__file__).resolve().parent
 
-    pitch = cv2.imread("pitch.jpg")
+    # Delete old heatmaps before starting so the dashboard doesn't show them
+    old_hm1 = agent_dir / "team1_pitch.png"
+    if old_hm1.exists():
+        old_hm1.unlink()
+    old_hm2 = agent_dir / "team2_pitch.png"
+    if old_hm2.exists():
+        old_hm2.unlink()
+
+    pitch_path = agent_dir / "pitch.jpg"
+    pitch = cv2.imread(str(pitch_path))
 
     if pitch is None:
-        print("Error: pitch.jpg not found")
+        print(f"Error: pitch image not found: {pitch_path}")
         return
 
     # Resize for better quality
@@ -735,6 +861,13 @@ def main():
         return
 
     pitch_norm = parse_norm_pitch_polygon(args.pitch_polygon)
+    homography_src = parse_norm_pitch_polygon(args.homography_src)
+    if homography_src is None:
+        homography_src = pitch_norm
+        
+    homography_dst = parse_norm_pitch_polygon(args.homography_dst)
+    if homography_dst is None:
+        homography_dst = parse_norm_pitch_polygon("0.0,0.0,1.0,0.0,1.0,1.0,0.0,1.0")
     ref_low = parse_hsv_triplet(args.referee_hsv_low)
     ref_high = parse_hsv_triplet(args.referee_hsv_high)
     teal_h_min, teal_h_max = parse_hue_pair(args.referee_teal_hue)
@@ -751,6 +884,16 @@ def main():
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    
+    H_matrix = None
+    if homography_src is not None and homography_dst is not None:
+        src_px = homography_src.copy()
+        src_px[:, 0] *= frame_width
+        src_px[:, 1] *= frame_height
+        dst_px = homography_dst.copy()
+        dst_px[:, 0] *= 1050
+        dst_px[:, 1] *= 680
+        H_matrix, _ = cv2.findHomography(src_px, dst_px)
     fps = int(round(fps)) if fps >= 1 else 25
 
     out = cv2.VideoWriter(
@@ -800,6 +943,7 @@ def main():
         f"Tracking: {'on' if args.track else 'off'} ({args.tracker}); "
         f"live stats -> {args.stats_out} every {max(1, args.stats_every)} frame(s)."
     )
+    print(f"Live analysis frame -> {args.live_frame_out}")
 
     prev_team_centroids: np.ndarray | None = None
     frame_idx = 0
@@ -820,6 +964,8 @@ def main():
     pending_owner_track_id: int | None = None
     pending_owner_frames = 0
     switch_frames = max(1, int(args.possession_switch_frames))
+    lost_owner_frames = 0
+    lost_frames_allowed = max(0, int(args.possession_lost_frames))
     last_ball_box: tuple[int, int, int, int] | None = None
     ball_miss_frames = 0
     ball_kalman = BallKalmanFilter()
@@ -830,6 +976,21 @@ def main():
     # 🔥 TEAM HEATMAP STORAGE (GLOBAL FOR WHOLE VIDEO)
     team1_positions = []
     team2_positions = []
+
+    reader = None
+    if args.enable_ocr:
+        try:
+            import ssl
+            ssl._create_default_https_context = ssl._create_unverified_context
+            import easyocr
+            reader = easyocr.Reader(['en'], gpu=want_half_precision(device) or device != 'cpu')
+            print("EasyOCR initialized successfully!")
+        except ImportError:
+            print("Warning: --enable-ocr passed but easyocr not installed. Run 'pip install easyocr'")
+    
+    import collections
+    ocr_memory = collections.defaultdict(list)
+    ocr_results_cache = {}
 
     while True:
         frame_idx += 1
@@ -885,7 +1046,9 @@ def main():
                     track_id = int(box.id[0])
                 raw.append((label, conf, x1, y1, x2, y2, track_id))
 
-        # Ball recovery pass: if full-frame misses, look around last known ball location.
+        ball_prediction = ball_kalman.predict()
+
+        # Ball recovery pass: if full-frame misses, look near the predicted ball location.
         saw_ball_in_raw = any(item[0] == "sports ball" for item in raw)
         if (
             args.ball_recover
@@ -893,15 +1056,24 @@ def main():
             and last_ball_box is not None
             and ball_miss_frames <= max(0, int(args.ball_recover_max_miss))
         ):
-            rx1, ry1, rx2, ry2 = expand_bbox(
-                last_ball_box[0],
-                last_ball_box[1],
-                last_ball_box[2],
-                last_ball_box[3],
-                float(args.ball_recover_scale),
-                frame_width,
-                frame_height,
-            )
+            if ball_prediction is not None:
+                rx1, ry1, rx2, ry2 = bbox_around_point(
+                    ball_prediction[0],
+                    ball_prediction[1],
+                    float(args.ball_kalman_gate),
+                    frame_width,
+                    frame_height,
+                )
+            else:
+                rx1, ry1, rx2, ry2 = expand_bbox(
+                    last_ball_box[0],
+                    last_ball_box[1],
+                    last_ball_box[2],
+                    last_ball_box[3],
+                    float(args.ball_recover_scale),
+                    frame_width,
+                    frame_height,
+                )
             if rx2 > rx1 and ry2 > ry1:
                 roi = frame[ry1:ry2, rx1:rx2]
                 rec = model.predict(
@@ -988,22 +1160,48 @@ def main():
                         lab = mean_lab(crop)
                 players.append((x1, y1, x2, y2, conf, is_ref, lab, track_id))
             elif label == "sports ball":
+                # Geometric filters to remove false positives
+                bw = x2 - x1
+                bh = y2 - y1
+                if bw <= 0 or bh <= 0:
+                    continue
+                aspect_ratio = float(bw) / float(bh)
+                # A ball is round. Reject extreme rectangles.
+                if aspect_ratio < 0.5 or aspect_ratio > 2.0:
+                    continue
+                # Reject huge boxes (larger than 80x80) or tiny boxes (<3x3)
+                if bw > 80 or bh > 80 or bw < 3 or bh < 3:
+                    continue
+                
                 if poly_px is not None and not ball_on_pitch(x1, y1, x2, y2, poly_px):
                     continue
                 balls.append((x1, y1, x2, y2, conf, track_id))
 
+        ball_source = "missing"
+        real_ball_detected = False
         if balls:
-            best_ball = max(balls, key=lambda b: b[4])
-            last_ball_box = (best_ball[0], best_ball[1], best_ball[2], best_ball[3])
-            ball_miss_frames = 0
-            # ✅ Update Kalman with real detection
-            bcx = 0.5 * (best_ball[0] + best_ball[2])
-            bcy = 0.5 * (best_ball[1] + best_ball[3])
-            ball_kalman.update(bcx, bcy)
-        else:
+            best_ball = choose_ball_candidate(
+                balls,
+                ball_prediction,
+                float(args.ball_kalman_gate),
+            )
+            if best_ball is not None:
+                real_ball_detected = best_ball[4] > 0
+                ball_source = "detected"
+                balls = [best_ball]
+                last_ball_box = (best_ball[0], best_ball[1], best_ball[2], best_ball[3])
+                ball_miss_frames = 0
+                # ✅ Update Kalman with real detection
+                bcx = 0.5 * (best_ball[0] + best_ball[2])
+                bcy = 0.5 * (best_ball[1] + best_ball[3])
+                ball_kalman.update(bcx, bcy)
+            else:
+                balls = [] # Reset so it triggers the missing logic
+
+        if not balls:
             ball_miss_frames += 1
             # ✅ Use Kalman prediction as synthetic ball position for possession/stats
-            pred = ball_kalman.predict()
+            pred = ball_prediction
             if pred is not None and ball_miss_frames <= args.ball_recover_max_miss:
                 px, py = pred
                 r = 12  # synthetic radius
@@ -1014,6 +1212,7 @@ def main():
                     None
                 )
                 balls = [synthetic_ball]
+                ball_source = "predicted"
                 # Draw predicted ball differently
                 cv2.circle(frame, (int(px), int(py)), r, (0, 165, 255), 2)  # orange = predicted
                 cv2.putText(frame, "ball~pred", (int(px) - 10, int(py) - 15),
@@ -1030,7 +1229,13 @@ def main():
                 for row, pi in enumerate(idx_non_ref):
                     lst = list(players[pi])
                     k = int(km_labels[row])
-                    lst.append(int(team_remap[k]))
+                    
+                    dist = float(np.linalg.norm(feats[row] - centroids[k]))
+                    if args.team_color_threshold > 0 and dist > args.team_color_threshold:
+                        pass # Reject outlier, do not append team_id
+                    else:
+                        lst.append(int(team_remap[k]))
+                        
                     players[pi] = tuple(lst)
             else:
                 for i, p in enumerate(players):
@@ -1168,6 +1373,9 @@ def main():
         # Possession: assign to nearest non-ref player (with team id) near the ball.
         owner_team = None
         owner_track_id = None
+        owner_candidate_team = None
+        owner_candidate_track_id = None
+        nearest_player_distance = None
         if balls and players:
             ball_best = max(balls, key=lambda b: b[4])
             bx = 0.5 * (ball_best[0] + ball_best[2])
@@ -1181,11 +1389,13 @@ def main():
                 dist = float(np.hypot(px - bx, py - by))
                 if dist < best_dist:
                     best_dist = dist
-                    owner_team = int(p[8])
-                    owner_track_id = p[7]
-            if best_dist > float(args.possession_radius):
-                owner_team = None
-                owner_track_id = None
+                    owner_candidate_team = int(p[8])
+                    owner_candidate_track_id = p[7]
+            if best_dist < float("inf"):
+                nearest_player_distance = best_dist
+            if best_dist <= float(args.possession_radius):
+                owner_team = owner_candidate_team
+                owner_track_id = owner_candidate_track_id
 
         # Smoothed runtime FPS for operator feedback + backend stats.
         now = time.perf_counter()
@@ -1193,54 +1403,90 @@ def main():
         inst_fps = 1.0 / dt
         live_fps = inst_fps if live_fps == 0.0 else (0.92 * live_fps + 0.08 * inst_fps)
         t_prev = now
-        # Debounce ownership switches to reduce flicker between close players.
-        if owner_track_id == current_owner_track_id:
+
+        # Debounce ownership switches, but do not erase possession on short ball dropouts.
+        if owner_track_id is None:
+            lost_owner_frames += 1
             pending_owner_team = None
             pending_owner_track_id = None
             pending_owner_frames = 0
+            if lost_owner_frames > lost_frames_allowed:
+                current_owner_team = None
+                current_owner_track_id = None
         else:
-            if owner_track_id == pending_owner_track_id:
-                pending_owner_frames += 1
+            lost_owner_frames = 0
+            if owner_track_id == current_owner_track_id:
+                pending_owner_team = None
+                pending_owner_track_id = None
+                pending_owner_frames = 0
             else:
-                pending_owner_team = owner_team
-                pending_owner_track_id = owner_track_id
-                pending_owner_frames = 1
-            if pending_owner_frames >= switch_frames:
-                if (
-                    previous_owner_team == pending_owner_team
-                    and previous_owner_track_id != pending_owner_track_id
-                    and previous_owner_track_id is not None
-                ):
-                    passes += 1
+                if owner_track_id == pending_owner_track_id:
+                    pending_owner_frames += 1
+                else:
+                    pending_owner_team = owner_team
+                    pending_owner_track_id = owner_track_id
+                    pending_owner_frames = 1
+                if pending_owner_frames >= switch_frames:
+                    if (
+                        current_owner_team == pending_owner_team
+                        and current_owner_track_id != pending_owner_track_id
+                        and current_owner_track_id is not None
+                    ):
+                        passes += 1
 
-                # =========================
-                # TOUCH COUNT (existing)
-                # =========================
-                if pending_owner_track_id is not None:
                     player_touch_counts[pending_owner_track_id] = (
                         player_touch_counts.get(pending_owner_track_id, 0) + 1
                     )
                     if pending_owner_team in (0, 1):
                         team_touch_counts[pending_owner_team] += 1
 
-                # =========================
-                # UPDATE PREVIOUS OWNER
-                # =========================
-                previous_owner_team = pending_owner_team
-                previous_owner_track_id = pending_owner_track_id
+                    previous_owner_team = pending_owner_team
+                    previous_owner_track_id = pending_owner_track_id
+                    current_owner_team = pending_owner_team
+                    current_owner_track_id = pending_owner_track_id
 
-                # =========================
-                # CURRENT OWNER UPDATE
-                # =========================
-                current_owner_team = pending_owner_team
-                current_owner_track_id = pending_owner_track_id
-
-                pending_owner_team = None
-                pending_owner_track_id = None
-                pending_owner_frames = 0
+                    pending_owner_team = None
+                    pending_owner_track_id = None
+                    pending_owner_frames = 0
 
         if current_owner_team in (0, 1):
             team_pos_seconds[current_owner_team] += dt
+
+        if reader is not None and frame_idx % 10 == 0:
+            ocr_batch = []
+            ocr_tracks = []
+            for p in players:
+                if p[5]: continue
+                if p[7] is None: continue
+                track_id = int(p[7])
+                if len(ocr_memory[track_id]) > 15: continue
+                
+                x1, y1, x2, y2, conf, is_ref, lab, track_id, team_id = p
+                box_w = x2 - x1
+                box_h = y2 - y1
+                if box_w < 15 or box_h < 40: continue
+                
+                cy1 = int(y1 + 0.15 * box_h)
+                cy2 = int(y1 + 0.45 * box_h)
+                cx1 = int(x1)
+                cx2 = int(x2)
+                
+                if cy2 > cy1 and cx2 > cx1:
+                    crop = frame[cy1:cy2, cx1:cx2]
+                    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                    gray = cv2.resize(gray, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+                    ocr_batch.append(gray)
+                    ocr_tracks.append(track_id)
+                if len(ocr_batch) >= 2:
+                    break
+            
+            for img, tid in zip(ocr_batch, ocr_tracks):
+                results = reader.readtext(img, allowlist='0123456789')
+                for (bbox, text, prob) in results:
+                    if prob > 0.4 and text.isdigit() and len(text) <= 2:
+                        ocr_memory[tid].append(text)
+                        counts = collections.Counter(ocr_memory[tid])
+                        ocr_results_cache[tid] = counts.most_common(1)[0][0]
 
         player_distance = {}
 
@@ -1257,12 +1503,44 @@ def main():
             team1_count = sum(1 for p in players if (not p[5]) and len(p) >= 9 and p[8] == 0)
             team2_count = sum(1 for p in players if (not p[5]) and len(p) >= 9 and p[8] == 1)
             referee_count = sum(1 for p in players if p[5])
-            players_count = sum(1 for p in players if not p[5])
-            tracked_player_ids = sorted({int(p[7]) for p in players if p[7] is not None})
+            players_count = team1_count + team2_count
+            tracked_player_ids = sorted({int(p[7]) for p in players if p[7] is not None and len(p) >= 9})
             tracked_ball_ids = sorted({int(b[5]) for b in balls if b[5] is not None})
             poss_total = team_pos_seconds[0] + team_pos_seconds[1]
             team1_pct = (100.0 * team_pos_seconds[0] / poss_total) if poss_total > 0 else 0.0
             team2_pct = (100.0 * team_pos_seconds[1] / poss_total) if poss_total > 0 else 0.0
+            radar_points = []
+            if H_matrix is not None:
+                for p in players:
+                    if p[5] or len(p) < 9 or p[7] is None or p[8] is None: continue
+                    x1, y1, x2, y2, conf, is_ref, lab, track_id, team_id = p
+                    px = 0.5 * (x1 + x2)
+                    py = float(y2)
+                    pt = np.array([[[px, py]]], dtype=np.float32)
+                    dst = cv2.perspectiveTransform(pt, H_matrix)[0][0]
+                    nx = float(dst[0] / 1050.0)
+                    ny = float(dst[1] / 680.0)
+                    if -0.2 < nx < 1.2 and -0.2 < ny < 1.2:
+                        jersey = ocr_results_cache.get(int(track_id))
+                        radar_points.append({
+                            "type": "player", 
+                            "team": int(team_id), 
+                            "id": int(track_id), 
+                            "x": nx, 
+                            "y": ny,
+                            "jersey": jersey
+                        })
+                if balls:
+                    best_ball = balls[0]
+                    bx = 0.5 * (best_ball[0] + best_ball[2])
+                    by = 0.5 * (best_ball[1] + best_ball[3])
+                    pt = np.array([[[bx, by]]], dtype=np.float32)
+                    dst = cv2.perspectiveTransform(pt, H_matrix)[0][0]
+                    nx = float(dst[0] / 1050.0)
+                    ny = float(dst[1] / 680.0)
+                    if -0.2 < nx < 1.2 and -0.2 < ny < 1.2:
+                        radar_points.append({"type": "ball", "team": None, "id": None, "x": nx, "y": ny})
+
             payload = {
                 "timestamp": time.time(),
                 "total_passes": passes,
@@ -1272,7 +1550,10 @@ def main():
                 "team1_players": team1_count,
                 "team2_players": team2_count,
                 "referees_detected": referee_count,
-                "ball_detected": bool(balls),
+                "ball_detected": bool(real_ball_detected),
+                "ball_available": bool(balls),
+                "ball_source": ball_source,
+                "ball_miss_frames": int(ball_miss_frames),
                 "tracked_player_ids": tracked_player_ids,
                 "tracked_ball_ids": tracked_ball_ids,
                 "possession_team": (
@@ -1287,9 +1568,30 @@ def main():
                 "team2_touches": int(team_touch_counts[1]),
                 "player_touch_counts": {str(k): int(v) for k, v in player_touch_counts.items()},
                 "possession_switch_frames": switch_frames,
+                "possession_lost_frames": int(lost_owner_frames),
+                "possession_lost_frames_allowed": int(lost_frames_allowed),
+                "radar_points": radar_points,
+                "possession_radius": float(args.possession_radius),
+                "ball_recover_max_miss": int(args.ball_recover_max_miss),
+                "ball_kalman_gate": float(args.ball_kalman_gate),
+                "owner_candidate_team": (
+                    None
+                    if owner_candidate_team is None
+                    else ("team1" if owner_candidate_team == 0 else "team2")
+                ),
+                "owner_candidate_track_id": owner_candidate_track_id,
+                "nearest_player_distance": (
+                    None
+                    if nearest_player_distance is None
+                    else round(float(nearest_player_distance), 2)
+                ),
+                "pending_owner_track_id": pending_owner_track_id,
+                "pending_owner_frames": int(pending_owner_frames),
                 "player_distance": {str(k): float(v) for k, v in player_distance.items()},
+                "analysis_frame_url": "/analysis-frame",
             }
             write_json_atomic(args.stats_out, payload)
+            write_frame_atomic(args.live_frame_out, frame)
 
 
 
@@ -1309,10 +1611,26 @@ def main():
 
 
     if team1_positions:
-        generate_pitch_heatmap(team1_positions, pitch, "team1_pitch.png", frame_w, frame_h)
+        generate_pitch_heatmap(
+            team1_positions,
+            pitch,
+            str(agent_dir / "team1_pitch.png"),
+            frame_w,
+            frame_h,
+            homography_src,
+            homography_dst,
+        )
 
     if team2_positions:
-        generate_pitch_heatmap(team2_positions, pitch, "team2_pitch.png", frame_w, frame_h)
+        generate_pitch_heatmap(
+            team2_positions,
+            pitch,
+            str(agent_dir / "team2_pitch.png"),
+            frame_w,
+            frame_h,
+            homography_src,
+            homography_dst,
+        )
 
     print("Heatmaps saved!")
 
