@@ -34,3 +34,10 @@ agent/venv/
 output_*.mp4
 *.log
 data/live_stats.json
+data/analysis_status.json
+data/analysis.log
+data/match_config.json
+
+# Uploaded match videos
+uploads/*
+!uploads/.gitkeep

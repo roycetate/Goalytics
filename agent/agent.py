@@ -1,4 +1,5 @@
 import argparse
+import collections
 import json
 import time
 from pathlib import Path
@@ -66,7 +67,7 @@ def parse_args():
         description="Goalytics: pitch-only detection, two teams (jersey colors), referee heuristic."
     )
     here = Path(__file__).resolve().parent
-    p.add_argument("--video", type=Path, default=here / "RMmatch.mov")
+    p.add_argument("--video", type=Path, default=here / "RMvsLVP2.mp4")
     p.add_argument("--model", type=Path, default=here / "yolov8m.pt")
     p.add_argument(
         "--out",
@@ -343,6 +344,31 @@ def parse_args():
         type=float,
         default=180.0,
         help="Prefer ball detections within this many pixels of the Kalman prediction.",
+    )
+    p.add_argument(
+        "--team1-attacks",
+        type=str,
+        choices=("left", "right"),
+        default="right",
+        help="Direction Team 1 attacks in pitch coordinates for shot/goal heuristics.",
+    )
+    p.add_argument(
+        "--shot-speed-min",
+        type=float,
+        default=0.018,
+        help="Minimum normalized pitch movement per frame to count a shot candidate.",
+    )
+    p.add_argument(
+        "--shot-cooldown-frames",
+        type=int,
+        default=25,
+        help="Minimum frames between counted shots for the same team.",
+    )
+    p.add_argument(
+        "--goal-cooldown-frames",
+        type=int,
+        default=70,
+        help="Minimum frames between counted goals for the same team.",
     )
     return p.parse_args()
 
@@ -958,6 +984,13 @@ def main():
     previous_owner_track_id = None
     previous_owner_team = None
     passes = 0
+    team_goals = {0: 0, 1: 0}
+    team_shots = {0: 0, 1: 0}
+    team_shots_on_target = {0: 0, 1: 0}
+    last_shot_frame = {0: -10_000, 1: -10_000}
+    last_shot_on_target_frame = {0: -10_000, 1: -10_000}
+    last_goal_frame = {0: -10_000, 1: -10_000}
+    ball_pitch_history = collections.deque(maxlen=10)
     current_owner_team: int | None = None
     current_owner_track_id: int | None = None
     pending_owner_team: int | None = None
@@ -988,7 +1021,6 @@ def main():
         except ImportError:
             print("Warning: --enable-ocr passed but easyocr not installed. Run 'pip install easyocr'")
     
-    import collections
     ocr_memory = collections.defaultdict(list)
     ocr_results_cache = {}
 
@@ -1452,6 +1484,83 @@ def main():
         if current_owner_team in (0, 1):
             team_pos_seconds[current_owner_team] += dt
 
+        if H_matrix is not None and balls:
+            best_ball = balls[0]
+            bx = 0.5 * (best_ball[0] + best_ball[2])
+            by = 0.5 * (best_ball[1] + best_ball[3])
+            pt = np.array([[[bx, by]]], dtype=np.float32)
+            dst = cv2.perspectiveTransform(pt, H_matrix)[0][0]
+            nx = float(dst[0] / 1050.0)
+            ny = float(dst[1] / 680.0)
+
+            if -0.15 < nx < 1.15 and -0.15 < ny < 1.15:
+                event_team = current_owner_team if current_owner_team in (0, 1) else previous_owner_team
+                ball_pitch_history.append((frame_idx, nx, ny, event_team))
+
+                if len(ball_pitch_history) >= 2 and event_team in (0, 1):
+                    _, prev_x, prev_y, _ = ball_pitch_history[-2]
+                    dx = nx - prev_x
+                    dy = ny - prev_y
+                    speed = float(np.hypot(dx, dy))
+                    team1_right = args.team1_attacks == "right"
+                    attacks_right = team1_right if event_team == 0 else not team1_right
+                    moving_toward_goal = dx > 0 if attacks_right else dx < 0
+                    attacking_third = nx >= 0.78 if attacks_right else nx <= 0.22
+                    final_channel = 0.18 <= ny <= 0.82
+                    goalmouth_y = 0.40 <= ny <= 0.60
+                    near_goal_line = nx >= 0.94 if attacks_right else nx <= 0.06
+                    crossed_goal_line = (
+                        (prev_x < 0.985 <= nx)
+                        if attacks_right
+                        else (prev_x > 0.015 >= nx)
+                    )
+                    can_count_shot = (
+                        frame_idx - last_shot_frame[event_team]
+                        >= max(1, int(args.shot_cooldown_frames))
+                    )
+                    can_count_goal = (
+                        frame_idx - last_goal_frame[event_team]
+                        >= max(1, int(args.goal_cooldown_frames))
+                    )
+                    can_count_shot_on_target = (
+                        frame_idx - last_shot_on_target_frame[event_team]
+                        >= max(1, int(args.shot_cooldown_frames))
+                    )
+
+                    if (
+                        can_count_shot
+                        and moving_toward_goal
+                        and attacking_third
+                        and final_channel
+                        and speed >= float(args.shot_speed_min)
+                    ):
+                        team_shots[event_team] += 1
+                        last_shot_frame[event_team] = frame_idx
+
+                    if (
+                        can_count_shot_on_target
+                        and
+                        moving_toward_goal
+                        and near_goal_line
+                        and goalmouth_y
+                        and speed >= float(args.shot_speed_min) * 0.6
+                    ):
+                        if frame_idx - last_shot_frame[event_team] <= max(1, int(args.shot_cooldown_frames)):
+                            team_shots_on_target[event_team] += 1
+                            last_shot_on_target_frame[event_team] = frame_idx
+
+                    if can_count_goal and crossed_goal_line and goalmouth_y:
+                        team_goals[event_team] += 1
+                        last_goal_frame[event_team] = frame_idx
+                        if frame_idx - last_shot_frame[event_team] > max(1, int(args.shot_cooldown_frames)):
+                            team_shots[event_team] += 1
+                            last_shot_frame[event_team] = frame_idx
+                        team_shots_on_target[event_team] = max(
+                            team_shots_on_target[event_team],
+                            team_goals[event_team],
+                        )
+                        last_shot_on_target_frame[event_team] = frame_idx
+
         if reader is not None and frame_idx % 10 == 0:
             ocr_batch = []
             ocr_tracks = []
@@ -1461,7 +1570,8 @@ def main():
                 track_id = int(p[7])
                 if len(ocr_memory[track_id]) > 15: continue
                 
-                x1, y1, x2, y2, conf, is_ref, lab, track_id, team_id = p
+                x1, y1, x2, y2 = p[0], p[1], p[2], p[3]
+                track_id = p[7]
                 box_w = x2 - x1
                 box_h = y2 - y1
                 if box_w < 15 or box_h < 40: continue
@@ -1590,6 +1700,25 @@ def main():
                 "player_distance": {str(k): float(v) for k, v in player_distance.items()},
                 "analysis_frame_url": "/analysis-frame",
             }
+            if H_matrix is not None:
+                payload.update(
+                    {
+                        "shot_detection_available": True,
+                        "team1_goals": int(team_goals[0]),
+                        "team2_goals": int(team_goals[1]),
+                        "total_goals": int(team_goals[0] + team_goals[1]),
+                        "team1_shots": int(team_shots[0]),
+                        "team2_shots": int(team_shots[1]),
+                        "total_shots": int(team_shots[0] + team_shots[1]),
+                        "team1_shots_on_target": int(team_shots_on_target[0]),
+                        "team2_shots_on_target": int(team_shots_on_target[1]),
+                        "total_shots_on_target": int(
+                            team_shots_on_target[0] + team_shots_on_target[1]
+                        ),
+                    }
+                )
+            else:
+                payload["shot_detection_available"] = False
             write_json_atomic(args.stats_out, payload)
             write_frame_atomic(args.live_frame_out, frame)
 

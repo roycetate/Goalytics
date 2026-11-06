@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Users, Zap, Cpu, Clock } from 'lucide-react'
 import { analysisStreamUrl, fetchHeatmaps, fetchStats, heatmapUrl } from '../api'
+import { teamAbbrev, useMatchConfig } from '../matchConfig'
 
 const POLL_MS = 200
 const UNAVAILABLE = 'Unavailable'
@@ -79,12 +80,14 @@ export default function DashboardPage() {
   const [heatmaps, setHeatmaps] = useState([])
   const [streamAvailable, setStreamAvailable] = useState(true)
   
-  const [team1Name, setTeam1Name] = useState('Liverpool')
-  const [team2Name, setTeam2Name] = useState('Real Madrid')
-  const [team1Color, setTeam1Color] = useState('#EF4444')
-  const [team2Color, setTeam2Color] = useState('#FFFFFF')
-  
+  const [match, setMatch] = useMatchConfig()
   const [activeHeatmapTeam, setActiveHeatmapTeam] = useState('team1')
+  const team1Name = match.team1_name
+  const team2Name = match.team2_name
+  const team1Color = match.team1_color
+  const team2Color = match.team2_color
+  const team1Short = teamAbbrev(team1Name, 'T1')
+  const team2Short = teamAbbrev(team2Name, 'T2')
 
   useEffect(() => {
     let alive = true
@@ -117,9 +120,10 @@ export default function DashboardPage() {
   }, [])
 
   const displayStats = stats || {}
-  
-  const team1Possession = asPercent(displayStats.team1_possession_pct, 58)
-  const team2Possession = asPercent(displayStats.team2_possession_pct, 42)
+  const analysis = displayStats.analysis || {}
+  const hasLive = Boolean(displayStats.timestamp)
+  const team1Possession = asPercent(displayStats.team1_possession_pct, hasLive ? 58 : 0)
+  const team2Possession = asPercent(displayStats.team2_possession_pct, hasLive ? 42 : 0)
   const possessionTotal = team1Possession + team2Possession
   const team1Share = possessionTotal > 0 ? (team1Possession / possessionTotal) * 100 : 50
   const possessionLeader =
@@ -148,6 +152,39 @@ export default function DashboardPage() {
     ['total_shots_on_target', 'shots_on_target'],
     [['team1_shots_on_target', 'liverpool_shots_on_target'], ['team2_shots_on_target', 'real_madrid_shots_on_target']]
   )
+  const team1Goals = getStat(displayStats, ['team1_goals', 'liverpool_goals'])
+  const team2Goals = getStat(displayStats, ['team2_goals', 'real_madrid_goals'])
+  const team1Shots = getStat(displayStats, ['team1_shots', 'liverpool_shots'])
+  const team2Shots = getStat(displayStats, ['team2_shots', 'real_madrid_shots'])
+  const team1ShotsOnTarget = getStat(displayStats, ['team1_shots_on_target', 'liverpool_shots_on_target'])
+  const team2ShotsOnTarget = getStat(displayStats, ['team2_shots_on_target', 'real_madrid_shots_on_target'])
+  const teamComparison = [
+    {
+      label: 'Possession',
+      team1: formatPercent(team1Possession),
+      team2: formatPercent(team2Possession),
+    },
+    {
+      label: 'Touches',
+      team1: formatMetric(displayStats.team1_touches),
+      team2: formatMetric(displayStats.team2_touches),
+    },
+    {
+      label: 'Players',
+      team1: formatMetric(displayStats.team1_players),
+      team2: formatMetric(displayStats.team2_players),
+    },
+    {
+      label: 'Shots',
+      team1: formatMetric(team1Shots),
+      team2: formatMetric(team2Shots),
+    },
+    {
+      label: 'On Target',
+      team1: formatMetric(team1ShotsOnTarget),
+      team2: formatMetric(team2ShotsOnTarget),
+    },
+  ]
 
   return (
     <div className="dashboard">
@@ -161,14 +198,14 @@ export default function DashboardPage() {
           <input 
             type="color" 
             value={team1Color} 
-            onChange={e => setTeam1Color(e.target.value)}
+            onChange={e => setMatch((curr) => ({ ...curr, team1_color: e.target.value }))}
             className="team-color-input"
             title="Team 1 Color"
           />
           <input 
             type="text" 
             value={team1Name} 
-            onChange={e => setTeam1Name(e.target.value)} 
+            onChange={e => setMatch((curr) => ({ ...curr, team1_name: e.target.value }))} 
             className="team-name-input"
             aria-label="Team 1 name"
           />
@@ -177,18 +214,63 @@ export default function DashboardPage() {
           <input 
             type="color" 
             value={team2Color} 
-            onChange={e => setTeam2Color(e.target.value)}
+            onChange={e => setMatch((curr) => ({ ...curr, team2_color: e.target.value }))}
             className="team-color-input"
             title="Team 2 Color"
           />
           <input 
             type="text" 
             value={team2Name} 
-            onChange={e => setTeam2Name(e.target.value)} 
+            onChange={e => setMatch((curr) => ({ ...curr, team2_name: e.target.value }))} 
             className="team-name-input"
             aria-label="Team 2 name"
           />
         </label>
+      </section>
+
+      <section className="match-header">
+        <div className="match-team match-team-left">
+          <span className="match-team-mark" style={{ background: team1Color }} />
+          <div>
+            <p>{team1Name}</p>
+            <small>{formatPercent(team1Possession)} possession</small>
+          </div>
+        </div>
+        <div className="match-scoreboard">
+          <div className="match-status">
+            <span className="status-dot" /> {analysis.status === 'running' ? 'Live analysis' : analysis.status === 'completed' ? 'Analysis complete' : 'Waiting'}
+          </div>
+          <div className="match-score">
+            <span>{formatMetric(team1Goals)}</span>
+            <b>:</b>
+            <span>{formatMetric(team2Goals)}</span>
+          </div>
+          <div className="match-meta">
+            <span>Leader: {possessionLeader}</span>
+            <span>{formatMetric(displayStats.fps)} FPS</span>
+          </div>
+        </div>
+        <div className="match-team match-team-right">
+          <div>
+            <p>{team2Name}</p>
+            <small>{formatPercent(team2Possession)} possession</small>
+          </div>
+          <span className="match-team-mark" style={{ background: team2Color }} />
+        </div>
+      </section>
+
+      <section className="team-comparison-strip">
+        <div className="comparison-team-name" style={{ '--team-color': team1Color }}>{team1Name}</div>
+        <div className="comparison-stats">
+          {teamComparison.map((item) => (
+            <div className="comparison-item" key={item.label}>
+              <span className="comparison-value">{item.team1}</span>
+              <span className="comparison-label">{item.label}</span>
+              <span className="comparison-value">{item.team2}</span>
+            </div>
+          ))}
+        </div>
+        <div className="comparison-team-name comparison-team-name-right" style={{ '--team-color': team2Color }}>{team2Name}</div>
       </section>
 
       {/* Live Match Hero Section */}
@@ -216,7 +298,9 @@ export default function DashboardPage() {
                 style={{ width: '100%', height: '100%', objectFit: 'contain' }}
               />
             ) : (
-              <div style={{ color: 'var(--text-muted)' }}>Start the detector to see live feed...</div>
+              <div style={{ color: 'var(--text-muted)', textAlign: 'center', padding: '1rem' }}>
+                Upload a match on the Videos page and start analysis to see the live feed.
+              </div>
             )}
           </div>
 
@@ -333,10 +417,10 @@ export default function DashboardPage() {
               onClick={() => setActiveHeatmapTeam(activeHeatmapTeam === 'team1' ? 'team2' : 'team1')}
             >
               <span className="team-toggle-track">
-                <span className="team-toggle-label">LIV</span>
-                <span className="team-toggle-label">RMA</span>
+                <span className="team-toggle-label">{team1Short}</span>
+                <span className="team-toggle-label">{team2Short}</span>
                 <span className="team-toggle-thumb">
-                  {activeHeatmapTeam === 'team1' ? 'LIV' : 'RMA'}
+                  {activeHeatmapTeam === 'team1' ? team1Short : team2Short}
                 </span>
               </span>
             </button>

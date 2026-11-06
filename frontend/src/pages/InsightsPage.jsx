@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Clock } from 'lucide-react'
 import { fetchHeatmaps, fetchStats, heatmapUrl } from '../api'
+import { teamAbbrev, useMatchConfig } from '../matchConfig'
 
 const POLL_MS = 200
 const UNAVAILABLE = 'Unavailable'
@@ -69,14 +70,15 @@ export default function InsightsPage() {
   const [stats, setStats] = useState(null)
   const [heatmaps, setHeatmaps] = useState([])
   const [selectedTeam, setSelectedTeam] = useState('team1')
+  const [match] = useMatchConfig()
 
   const teams = {
     team1: {
       id: 'team1',
       index: 0,
-      name: 'Liverpool',
-      color: '#EF4444',
-      activeTextColor: '#FFFFFF',
+      name: match.team1_name,
+      color: match.team1_color,
+      short: teamAbbrev(match.team1_name, 'T1'),
       possessionKey: 'team1_possession_pct',
       playersKey: 'team1_players',
       touchesKey: 'team1_touches',
@@ -87,9 +89,9 @@ export default function InsightsPage() {
     team2: {
       id: 'team2',
       index: 1,
-      name: 'Real Madrid',
-      color: '#FFFFFF',
-      activeTextColor: '#111827',
+      name: match.team2_name,
+      color: match.team2_color,
+      short: teamAbbrev(match.team2_name, 'T2'),
       possessionKey: 'team2_possession_pct',
       playersKey: 'team2_players',
       touchesKey: 'team2_touches',
@@ -136,12 +138,13 @@ export default function InsightsPage() {
   const team2Name = teams.team2.name
   const team1Color = teams.team1.color
   const team2Color = teams.team2.color
-  const team1Possession = asPercent(displayStats.team1_possession_pct, 58)
-  const team2Possession = asPercent(displayStats.team2_possession_pct, 42)
+  const hasLive = Boolean(displayStats.timestamp)
+  const team1Possession = asPercent(displayStats.team1_possession_pct, hasLive ? 58 : 0)
+  const team2Possession = asPercent(displayStats.team2_possession_pct, hasLive ? 42 : 0)
   const possessionTotal = team1Possession + team2Possession
   const team1Share = possessionTotal > 0 ? (team1Possession / possessionTotal) * 100 : 50
-  const selectedPossession = asPercent(displayStats[selected.possessionKey], selectedTeam === 'team1' ? 58 : 42)
-  const opponentPossession = asPercent(displayStats[opponent.possessionKey], selectedTeam === 'team1' ? 42 : 58)
+  const selectedPossession = asPercent(displayStats[selected.possessionKey], hasLive ? (selectedTeam === 'team1' ? 58 : 42) : 0)
+  const opponentPossession = asPercent(displayStats[opponent.possessionKey], hasLive ? (selectedTeam === 'team1' ? 42 : 58) : 0)
   const possessionDiff = selectedPossession - opponentPossession
   const selectedPlayerIds = new Set(
     (displayStats.radar_points ?? [])
@@ -168,10 +171,10 @@ export default function InsightsPage() {
             onClick={() => setSelectedTeam(selectedTeam === 'team1' ? 'team2' : 'team1')}
           >
             <span className="team-toggle-track">
-              <span className="team-toggle-label">LIV</span>
-              <span className="team-toggle-label">RMA</span>
+              <span className="team-toggle-label">{teams.team1.short}</span>
+              <span className="team-toggle-label">{teams.team2.short}</span>
               <span className="team-toggle-thumb">
-                {selectedTeam === 'team1' ? 'LIV' : 'RMA'}
+                {selected.short}
               </span>
             </span>
           </button>

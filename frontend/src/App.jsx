@@ -12,6 +12,7 @@ function App() {
         <header className="header">
           <nav className="header-nav">
             <NavLink to="/dashboard">Dashboard</NavLink>
+            <NavLink to="/insights">Insights</NavLink>
           </nav>
 
           <div className="logo-container">
@@ -19,7 +20,8 @@ function App() {
           </div>
 
           <nav className="header-nav">
-            <NavLink to="/insights">Insights</NavLink>
+            <NavLink to="/videos">Videos</NavLink>
+            <NavLink to="/analysis-stream">Stream</NavLink>
           </nav>
         </header>
 
